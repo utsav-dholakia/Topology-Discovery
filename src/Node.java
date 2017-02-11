@@ -30,11 +30,6 @@ public class Node{
     // Integer = Node ID, ArrayList<Integer> = 0 -> Hop-count, 1 -> Done marked by this node(0 or 1)(only when all its children did)?
     public static volatile boolean localTermination = false;//Stop sending original messages, keep receiving and replying
     public static volatile boolean globalTermination = false;//Stop all events and server and the whole program
-    public static volatile HashMap<Integer, Integer> repliesExpected = new HashMap <Integer, Integer>();//Mark
-    // how many neighbours we have sent messages to(Originated by some node), so we should expect replies from them
-    // before moving the message upwards <Integer = Originator Node ID, Integer = How many messages forwarded by me>
-    /*public static volatile HashMap<Integer, Integer> neighbourDoneMarkedForANode = new HashMap<Integer, Integer>();//This
-    // structure saves which messages(originated from which nodes) have got how many done flags from its children*/
 
     Node(){}
 
@@ -202,7 +197,6 @@ class Message implements Serializable{
         this.parentList = parentList;
         this.hopCount = round;  //Initialize hopcount with the current round of the node
         this.reply = reply;
-        //this.done = done;
     }
 }
 
@@ -225,10 +219,17 @@ class Sender implements Runnable{
         Iterator<Integer> it = neighbours.keySet().iterator();
         while(it.hasNext()) {
             neighbourID = it.next();
-            //The neighbour that we want to send message to has already not marked itself as done
-            if(Node.topologyKnowledge.get(neighbourID).get(1) == 0){
+            //The neighbour that we want to send message to is already not available in knowledge
+            if(Node.topologyKnowledge.get(neighbourID).get(1) != 1){
                 try {
-                    Node.noOfMessagesSent++;    //Increase number of messages sent by 1
+                    //Store how many messages are sent for current Node by the current Node
+                    if(!Receiver.repliesExpectedFromNeighbours.containsKey(Node.nodeID)){
+                        Receiver.repliesExpectedFromNeighbours.put(Node.nodeID, 1);
+                    }
+                    else{
+                        Integer value = Receiver.repliesExpectedFromNeighbours.get(Node.nodeID);
+                        Receiver.repliesExpectedFromNeighbours.put(Node.nodeID, value + 1);
+                    }
                     ArrayList<String> hostPort = neighbours.get(neighbourID);
                     System.out.println("Sending message to :" + hostPort.get(0));
                     clientSocket = new Socket(hostPort.get(0), Integer.valueOf(hostPort.get(1)));
@@ -238,6 +239,10 @@ class Sender implements Runnable{
                 } catch (Exception e) {
                     System.out.println(e);
                 }
+            }
+            else{
+                System.out.println("Neighbour : " + neighbourID + " has marked itself done : " +
+                        Node.topologyKnowledge.get(neighbourID).get(1));
             }
         }
     }
@@ -262,7 +267,17 @@ class Receiver implements Runnable{
     static Boolean serverOn = true;
     Integer currPortNum;
     String currHostName;
+    //This structure stores all the messages that are going to be processed
+    public static ArrayList<Message> messagesToBeProcessed = new ArrayList<Message>();
+    //This structure allows us to buffer messages till we reach the round of the message
     public static volatile Queue<Message> queueForMessage = new LinkedList<Message>();
+    //This structure will store all the messages originated at a particular node has been propagated and how many replies
+    // are expected from its children; <Int = Node ID, Int = No of messages sent, that many replies expected>
+    public static volatile HashMap<Integer, Integer> repliesExpectedFromNeighbours = new HashMap<Integer, Integer>();
+    //This structure will store all the messages originated at a particular node has been propagated and the replies are
+    // expected from its children, till it comes back; <Int = Node ID, LinkedList<Message> = Message storage>
+    public static volatile HashMap<Integer, LinkedList<Message>> bufferReplyMessages =
+            new HashMap<Integer, LinkedList<Message>>();
 
     Receiver(HashMap<Integer, ArrayList<String>> neighbours, Integer currPortNum,
              String currHostName) {
@@ -296,7 +311,6 @@ class Receiver implements Runnable{
 
 class Processor implements Runnable {
     Socket myClientSocket;
-    public static ArrayList<Message> messagesToBeProcessed = new ArrayList<Message>();;
 
     Processor(Socket s) {
         myClientSocket = s;
@@ -310,8 +324,8 @@ class Processor implements Runnable {
                 return;
             }
             //Read the new Message that came on the server and add it to the list of messages to be processed
-            messagesToBeProcessed.add((Message)new ObjectInputStream(myClientSocket.getInputStream()).readObject());
-            for(Message inMessage : messagesToBeProcessed) {
+            Receiver.messagesToBeProcessed.add((Message)new ObjectInputStream(myClientSocket.getInputStream()).readObject());
+            for(Message inMessage : Receiver.messagesToBeProcessed) {
                 System.out.println("InMessage : src node ID : " + inMessage.srcNodeID + " round : " + inMessage.round);
                 //If the current round of node less than the round of message
                 while (inMessage.round > Node.roundOfNode) {
@@ -345,37 +359,40 @@ class Processor implements Runnable {
                                 Node.topologyKnowledge.put(key, inMessage.nodesDiscovered.get(key));
                             }
                         }
-                        Node.noOfMessagesSent--;
-                        //If the message came from node and all the messages have come
-
-                        if ((Node.noOfMessagesSent == 0)) {
-                            Node.localTermination = true;
-                        }
-                        //Decrease the number of messages sent and if 0 then increase round of current node
-                        if (Node.noOfMessagesSent == 0) {
-                            if (!Node.localTermination) {
-                                Node.roundOfNode++;
-                                System.out.println("Increased node's round to : " + Node.roundOfNode);
-                                if(Receiver.queueForMessage.size() > 0){
-                                    Iterator<Message> processMessageIterator = Receiver.queueForMessage.iterator();
-                                    while(processMessageIterator.hasNext()){
-                                        Message nextMessage = processMessageIterator.next();
-                                        //If the message in a queue has the same round as the node's round, then add it to process list
-                                        if(nextMessage.round == Node.roundOfNode){
-                                            messagesToBeProcessed.add(Receiver.queueForMessage.remove());
-                                        }
+                        Integer value = Receiver.repliesExpectedFromNeighbours.get(Node.nodeID);
+                        Receiver.repliesExpectedFromNeighbours.put(Node.nodeID, value - 1);
+                        //If all the neighbours have replied back
+                        //Decrease the number of messages got replied back and if 0 then increase round of current node
+                        if (Receiver.repliesExpectedFromNeighbours.get(Node.nodeID) == 0) {
+                            //Check if localTermination is to be marked
+                            Boolean doneMarkedByAllNeighbours = true;
+                            Iterator<Integer> iterateNeighbours = Node.neighbours.keySet().iterator();
+                            while (it.hasNext()) {
+                                //If a neighbour node has not marked itself done
+                                if (Node.topologyKnowledge.get(it.next()).get(1) == 0) {
+                                    doneMarkedByAllNeighbours = false;
+                                    break;
+                                }
+                            }
+                            //If all the neighbours marked themselves done
+                            if (doneMarkedByAllNeighbours) {
+                                Node.localTermination = true;
+                                System.out.println("Local termination marked. Node will not send any original messages now!");
+                            }
+                            //Increase node's round as all neighbours replied back
+                            Node.roundOfNode++;
+                            System.out.println("Increased node's round to : " + Node.roundOfNode);
+                            if (Receiver.queueForMessage.size() > 0) {
+                                Iterator<Message> processMessageIterator = Receiver.queueForMessage.iterator();
+                                while (processMessageIterator.hasNext()) {
+                                    Message nextMessage = processMessageIterator.next();
+                                    //If the message in a queue has the same round as the node's round, then add it to process list
+                                    if (nextMessage.round == Node.roundOfNode) {
+                                        Receiver.messagesToBeProcessed.add(Receiver.queueForMessage.remove());
+                                        System.out.println("Message added to the process message list");
                                     }
                                 }
-                                else{
-                                    new Thread(new Sender(Node.neighbours, Node.topologyKnowledge), "Sender").start();
-                                }
-                            } else {
-                                System.out.println("Local termination marked. Node will not send any original messages now!");
-                                //Local termination is marked, discard message and close connection
                             }
-                        } else {
-                            //Reply message came from a neighbour, round is not to be increased
-                            // because some messages have yet not arrived
                         }
                     }
                     //The messages is not a reply, which is not a valid message, discard it
@@ -385,25 +402,106 @@ class Processor implements Runnable {
                 }
                 //If the message came with source node ID other than the current node's ID
                 else if (!inMessage.srcNodeID.equals(Node.nodeID)) {
-                    inMessage.hopCount--;   //To decide whether to propagate this message further or not
+                    if(inMessage.hopCount > 0) {
+                        inMessage.hopCount--;   //To decide whether to propagate this message further or not
+                    }
 
                     if (inMessage.hopCount == 0) {    //Don't forward this message, just reply back
-                        inMessage.reply = true; //Set reply flag true
-                        Integer dstParent = inMessage.parentList.pop();
-                        ArrayList<String> destination = Node.neighbours.get(dstParent);
-                        try {
-                            System.out.println("Sending message to :" + destination.get(0));
-                            System.out.println("OutMessage : src node ID : " + inMessage.srcNodeID + " round : " + inMessage.round);
-                            Socket clientSocket = new Socket(destination.get(0), Integer.valueOf(destination.get(1)));
-                            ObjectOutputStream outMessage = new ObjectOutputStream(clientSocket.getOutputStream());
-                            outMessage.writeObject(inMessage);
-                            clientSocket.close();
-                        } catch (Exception e) {
-                            System.out.println(e);
+                        //If the message is forwarded to me, but I'm the last hop for this round, so we'll mark reply true
+                        if(!inMessage.reply) {
+                            inMessage.reply = true;
+                            //Integer myHopCount = inMessage.nodesDiscovered.get(Node.nodeID).get(0);//Check hopcount of myself
+                            //Check if all my neighbours are in the knowledge or not
+                            Iterator<Integer> iterateNeighbours = Node.neighbours.keySet().iterator();
+                            Integer nextNeighbour;
+                            Boolean neighboursDiscovered = true;
+                            ArrayList<Integer> neighbour;
+                            while (iterateNeighbours.hasNext()) {
+                                nextNeighbour = iterateNeighbours.next();
+                                //Neighbour found which is not in the discovered nodes list
+                                if (!inMessage.nodesDiscovered.containsKey(nextNeighbour)) {
+                                /*neighbour = new ArrayList<Integer>(2);
+                                neighbour.add(nextNeighbour);
+                                neighbour.add(0);
+                                inMessage.nodesDiscovered.put(myHopCount+1, neighbour);*/
+                                    neighboursDiscovered = false;
+                                }
+                            }
+                            //All the neighbours are already discovered, so mark myself as done
+                            if (neighboursDiscovered) {
+                                neighbour = inMessage.nodesDiscovered.get(Node.nodeID);
+                                neighbour.add(1, 1);//Mark myself done
+                                inMessage.nodesDiscovered.put(Node.nodeID, neighbour);
+                            }
+                            if (!inMessage.parentList.isEmpty()) {
+                                Integer dstParent = inMessage.parentList.pop();
+                                ArrayList<String> destination = Node.neighbours.get(dstParent);
+                                try {
+                                    System.out.println("Sending message to : " + destination.get(0));
+                                    System.out.println("OutMessage : src node ID : " + inMessage.srcNodeID + " round : " + inMessage.round);
+                                    Socket clientSocket = new Socket(destination.get(0), Integer.valueOf(destination.get(1)));
+                                    ObjectOutputStream outMessage = new ObjectOutputStream(clientSocket.getOutputStream());
+                                    outMessage.writeObject(inMessage);
+                                    clientSocket.close();
+                                } catch (Exception e) {
+                                    System.out.println(e);
+                                }
+                            } else {
+                                System.out.println("ERROR : Parent list(Stack) is empty...");
+                                System.out.println("Wanted to send below message");
+                                System.out.println("OutMessage : src node ID : " + inMessage.srcNodeID + " round : " + inMessage.round);
+                            }
                         }
-                    } else {
-
+                        //The message already has reply->true, so I have to forward it to my parent when I get all
+                        // replies from my children for this messages's source node
+                        else {
+                            Integer value = Receiver.repliesExpectedFromNeighbours.get(inMessage.srcNodeID);
+                            Receiver.repliesExpectedFromNeighbours.put(inMessage.srcNodeID, value - 1);
+                            //If all the neighbours have replied back , consolidate all the reply messages stored for
+                            // this source Node in the buffer and send it to our parent(check done condition)
+                            if (Receiver.repliesExpectedFromNeighbours.get(inMessage.srcNodeID) == 0) {
+                                Iterator<Message> messageIterator = Receiver.bufferReplyMessages.get(inMessage.srcNodeID).listIterator();
+                                System.out.println("Consolidating below message for replying back...");
+                                System.out.println("OutMessage : src node ID : " + inMessage.srcNodeID + " round : " + inMessage.round);
+                                while(messageIterator.hasNext()){
+                                    Message temp = messageIterator.next();
+                                    Iterator<Integer> it = temp.nodesDiscovered.keySet().iterator();
+                                    Integer key = 0;
+                                    while (it.hasNext()) {
+                                        key = it.next();
+                                        //Try to mark done flag->on for any node by any message if it is there
+                                        if((inMessage.nodesDiscovered.get(key).get(1) + temp.nodesDiscovered.get(key).get(1)) > 0){
+                                            inMessage.nodesDiscovered.get(key).set(1, 1);
+                                        }
+                                        //Try to change the hop-count to whatever is minimal in all messages for each node
+                                        if(inMessage.nodesDiscovered.containsKey(key)) {
+                                            if (inMessage.nodesDiscovered.get(key).get(0) > temp.nodesDiscovered.get(key).get(0)) {
+                                                inMessage.nodesDiscovered.put(key, temp.nodesDiscovered.get(key));
+                                            }
+                                        }
+                                        //If any node is not present in the knowledge yet, add it
+                                        else{
+                                            inMessage.nodesDiscovered.put(key, temp.nodesDiscovered.get(key));
+                                        }
+                                    }
+                                }
+                            }
+                            //If all the replies are not yet back, till then buffer this reply
+                            else {
+                                LinkedList<Message> repliesYet = Receiver.bufferReplyMessages.get(inMessage.srcNodeID);
+                                repliesYet.add(inMessage);
+                                Receiver.bufferReplyMessages.put(inMessage.srcNodeID, repliesYet);
+                            }
+                        }
                     }
+                    //Hop-count is not zero, so message has to be propagated ahead
+                    else {
+                        Integer value = Receiver.repliesExpectedFromNeighbours.get(inMessage.srcNodeID);
+                        Receiver.repliesExpectedFromNeighbours.put(inMessage.srcNodeID, value + 1);
+                    }
+                }
+                if(!Node.localTermination) {
+                    new Thread(new Sender(Node.neighbours, Node.topologyKnowledge), "Sender").start();
                 }
             }
         }catch(EOFException eof){
