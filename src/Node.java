@@ -1,12 +1,12 @@
-import com.sun.org.apache.xpath.internal.operations.Bool;
-
 import java.io.*;
-import java.lang.reflect.Array;
 import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.util.*;
-import java.util.concurrent.locks.ReentrantLock;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
+
+import static java.lang.Thread.*;
 
 
 /**
@@ -16,20 +16,21 @@ import java.util.concurrent.locks.ReentrantLock;
  */
 
 public class Node{
-    public static String configFileName = "./launch/config.txt";
+    public static String configFileName = "./Topology-Discovery/launch/config.txt";
     //Integer = Node ID, ArrayList<String> = 0 -> Hostname, 1 -> Port number
-    public static volatile HashMap<Integer, ArrayList<String>> neighbours = new HashMap<Integer, ArrayList<String>>();
+    public static volatile ConcurrentHashMap<Integer, ArrayList<String>> neighbours =
+            new ConcurrentHashMap<Integer, ArrayList<String>>();
     public static Integer nodeID;       //Current Node's nodeID
     public static String currHostName;  //Current Node's hostname
     public static Integer currPortNum;  //Current Node's port number
     public static Integer totalNodes;   //Total nodes in topology
     public static volatile Integer roundOfNode = 1;  //Indicates node is in which round
-    public static volatile Integer noOfMessagesSent = 0; //Indicates no. of outbound messages in this round
-    public static volatile HashMap<Integer, ArrayList<Integer>> topologyKnowledge =
-            new HashMap<Integer, ArrayList<Integer>>(); //Knowledge gathered about topology by current node,
+    public static volatile ConcurrentHashMap<Integer, ArrayList<Integer>> topologyKnowledge =
+            new ConcurrentHashMap<Integer, ArrayList<Integer>>(); //Knowledge gathered about topology by current node,
     // Integer = Node ID, ArrayList<Integer> = 0 -> Hop-count, 1 -> Done marked by this node(0 or 1)(only when all its children did)?
     public static volatile boolean localTermination = false;//Stop sending original messages, keep receiving and replying
     public static volatile boolean globalTermination = false;//Stop all events and server and the whole program
+    public static TreeMap<Integer, HashSet<Integer>> myKnowledge = new TreeMap<Integer, HashSet<Integer>>();
 
     Node(){}
 
@@ -51,7 +52,6 @@ public class Node{
             Integer validLines = 0;
             while ((sCurrentLine = br.readLine()) != null) {
                 System.out.println(sCurrentLine);
-                ArrayList<Integer> listForNode;
                 String delimiters = "\\s+[\t]*|\\s*[\t]+";
                 String[] splitArray;
                 sCurrentLine = sCurrentLine.trim();
@@ -80,27 +80,35 @@ public class Node{
                     Node.currPortNum = Integer.valueOf(splitArray[2]);
                     validLines--;
                 }
-                else if(!splitArray[1].startsWith("dc") && (Integer.valueOf(splitArray[0]) == Node.nodeID)){
+                else if(!splitArray[1].startsWith("dc")){
+                    validLines--;
                     //Found current Node's neighbour list
                     String [] neighbourID = sCurrentLine.split(delimiters);
                     BufferedReader scanForAddress;
-                    listForNode = new ArrayList<Integer>(2);
-                    listForNode.add(0);
-                    listForNode.add(0);
-                    Node.topologyKnowledge.put(Node.nodeID, listForNode); //Add current Node's ID with hop-count 0
-                    for(int i = 1; i < neighbourID.length; i++){
+                    ArrayList<Integer> listForNode = new ArrayList<Integer>();
+                    Receiver.toplogyKnowledge.put(Integer.valueOf(neighbourID[0]), listForNode);
+                    if(Node.nodeID == Integer.valueOf(neighbourID[0])) {
                         listForNode = new ArrayList<Integer>(2);
-                        listForNode.add(1);
                         listForNode.add(0);
-                        //Add all current neighbours with 1-hop distance in the topologyKnowledge map
-                        Node.topologyKnowledge.put(Integer.valueOf(neighbourID[i]), listForNode);
+                        listForNode.add(0);
+                        Node.topologyKnowledge.put(Node.nodeID, listForNode); //Add current Node's ID with hop-count 0
+                    }
+                    for(int i = 1; i < neighbourID.length; i++){
+                        if(Node.nodeID == Integer.valueOf(neighbourID[0])) {
+                            listForNode = new ArrayList<Integer>(2);
+                            listForNode.add(1);
+                            listForNode.add(0);
+                            //Add all current neighbours with 1-hop distance in the topologyKnowledge map
+                            Node.topologyKnowledge.put(Integer.valueOf(neighbourID[i]), listForNode);
+                        }
+                        Receiver.toplogyKnowledge.get(Integer.valueOf(neighbourID[0])).add(Integer.valueOf(neighbourID[i]));
                         //Mark done as false from the immediate neighbour(Its branch has not been discovered completely)
                         //Node.doneMarkedByNeighbour.put(Integer.valueOf(neighbourID[i]), false);
                         scanForAddress = new BufferedReader(new FileReader(configFileName));
                         //Read hostname and port number for every neighbour ID using new reader from the start
                         String line, hostName;
                         Integer portNum;
-                        while((line = scanForAddress.readLine()) != null){
+                        while((line = scanForAddress.readLine()) != null && Node.nodeID == Integer.valueOf(neighbourID[0])){
                             String[] splitLine;
                             if(line.length() < 1 || line.charAt(0) == '#') {
                                 //If line is empty or starts with a comment
@@ -141,25 +149,34 @@ public class Node{
                         scanForAddress.close();
                     }
                 }
-                else{
-                        //Found some other Node's neighbour list
-                        continue;
-                }
             }
-
+            Sender.process();
             //Set the roundOfNode = 1
             Node.roundOfNode = 1;
             //Spawn the thread of the server/receiver class
-            Thread server = new Thread(new Receiver(Node.neighbours, Node.currPortNum, Node.currHostName),"Server");
+            final Thread server = new Thread(new Receiver(Node.currPortNum, Node.currHostName),"Server");
             server.start();
 
             //Make the thread sleep for 5 seconds until the servers are up
-            Thread.sleep(5000);
+            sleep(3000);
             //Spawn the thread of sender class that will send out messages to all neighbours
             Thread client = new Thread(new Sender(Node.neighbours, Node.topologyKnowledge), "Sender");
             client.start();
 
-
+            Timer timer = new Timer();
+            TimerTask tasknew = new TimerTask() {
+                @Override
+                public void run() {
+                    System.out.println("Global termination marked, server has stopped.");
+                    Node.globalTermination = true;
+                    Receiver.messagesToBeProcessed.clear();
+                    Processor.threadRunning = false;
+                    Receiver.repliesExpectedFromNeighbours.clear();
+                    Receiver.futureRoundMessageQueue.clear();
+                    Sender.printOutput();
+                }
+            };
+            timer.schedule(tasknew, 10000);
         } catch (FileNotFoundException e1) {
                 e1.printStackTrace();
             } catch (IOException e1) {
@@ -173,7 +190,7 @@ public class Node{
                     if (fr != null)
                         fr.close();
                 } catch (IOException ex) {
-                    ex.printStackTrace();
+                    //ex.printStackTrace();
                 }
             }
     }
@@ -188,7 +205,7 @@ class Message implements Serializable{
     public Stack<Integer> parentList;  //Parents in a reverse order through which path the done message will travel
     public Integer hopCount;    //Total no. of hops that is allowed for this message to traverse
     public boolean reply = false;   //If this message is a reply back to the source node or not
-    //public boolean done = false;    //If the node that the message has reached to, has nowhere to send it ahead
+    public boolean termination = false;    //If the node sending this message has said it has locally terminated
     Message(Integer srcNodeID, Integer round, HashMap<Integer, ArrayList<Integer>> nodesDiscovered,
             Stack<Integer> parentList, Integer hopCount, boolean reply, boolean done){
         this.srcNodeID = srcNodeID;
@@ -197,17 +214,18 @@ class Message implements Serializable{
         this.parentList = parentList;
         this.hopCount = round;  //Initialize hopcount with the current round of the node
         this.reply = reply;
+        this.termination = termination;
     }
 }
 
 class Sender implements Runnable{
     Socket clientSocket;
-    HashMap<Integer, ArrayList<String>> neighbours;
-    HashMap<Integer, ArrayList<Integer>> topologyKnowledge;
+    ConcurrentHashMap<Integer, ArrayList<String>> neighbours;
+    ConcurrentHashMap<Integer, ArrayList<Integer>> topologyKnowledge;
     Message message;
     /*//Map for storing How many messages with a given source node ID are propagated for by current Node
     public static volatile HashMap<Integer, Integer> messagesSentForSomeNode = new HashMap<Integer, Integer>();*/
-    Sender(HashMap<Integer, ArrayList<String>> neighbours, HashMap<Integer, ArrayList<Integer>> topologyKnowledge){
+    Sender(ConcurrentHashMap<Integer, ArrayList<String>> neighbours, ConcurrentHashMap<Integer, ArrayList<Integer>> topologyKnowledge){
         this.neighbours = neighbours;
         this.topologyKnowledge = topologyKnowledge;
     }
@@ -237,13 +255,13 @@ class Sender implements Runnable{
                     outMessage.writeObject(message);
                     clientSocket.close();
                 } catch (Exception e) {
-                    System.out.println(e);
+                    //System.out.println(e);
                 }
             }
-            else{
+            /*else{
                 System.out.println("Neighbour : " + neighbourID + " has marked itself done : " +
                         Node.topologyKnowledge.get(neighbourID).get(1));
-            }
+            }*/
         }
     }
 
@@ -261,26 +279,72 @@ class Sender implements Runnable{
         message = new Message(Node.nodeID, Node.roundOfNode, nodesDiscovered, parents, Node.roundOfNode,
                 false, false);
     }
+
+    public static void process(){
+        Integer hopcount = 0;
+        Receiver.explored.add(Node.nodeID);
+        Receiver.process.add(Node.nodeID);
+        while(!Receiver.process.isEmpty()) {
+            int size = Receiver.process.size(), i = 0;
+            HashSet<Integer> toBeAdded = new HashSet<Integer>();
+            while(i < size){
+                Integer popped = Receiver.process.poll();
+                toBeAdded.add(popped);
+                ArrayList<Integer> list = Receiver.toplogyKnowledge.get(popped);
+                for(Integer node : list){
+                    if(!Receiver.explored.contains(node)){
+                        Receiver.explored.add(node);
+                        Receiver.process.add(node);
+                    }
+                }
+                i++;
+            }
+            if(hopcount != 0){
+                Node.myKnowledge.put(hopcount, toBeAdded);
+            }
+            hopcount++;
+        }
+    }
+
+    public static void printOutput(){
+
+        System.out.println("Node_ID ---------------- HOP_COUNT ---------------- NEIGHBOURS");
+        System.out.print(Node.nodeID);
+        Iterator<Integer> iterateOverHops = Node.myKnowledge.keySet().iterator();
+        HashSet<Integer> nodes;
+        Integer hopCount;
+        while(iterateOverHops.hasNext()){
+            hopCount = iterateOverHops.next();
+            System.out.print("                      " + hopCount + "                          ");
+            nodes = Node.myKnowledge.get(hopCount);
+            for(Integer node : nodes){
+                System.out.print(node + ", ");
+            }
+            System.out.println();
+        }
+        System.out.println("----------------------------------------------------------------");
+    }
 }
 
 class Receiver implements Runnable{
-    static Boolean serverOn = true;
     Integer currPortNum;
     String currHostName;
     //This structure stores all the messages that are going to be processed
-    public static ArrayList<Message> messagesToBeProcessed = new ArrayList<Message>();
+    public static volatile ConcurrentLinkedQueue<Message> messagesToBeProcessed = new ConcurrentLinkedQueue<Message>();
     //This structure allows us to buffer messages till we reach the round of the message
-    public static volatile Queue<Message> queueForMessage = new LinkedList<Message>();
+    public static Queue<Message> futureRoundMessageQueue = new LinkedList<Message>();
     //This structure will store all the messages originated at a particular node has been propagated and how many replies
     // are expected from its children; <Int = Node ID, Int = No of messages sent, that many replies expected>
+    public static HashMap<Integer, ArrayList<Integer>> toplogyKnowledge = new HashMap<Integer, ArrayList<Integer>>();
+    public static HashSet<Integer> explored = new HashSet<Integer>();
+    public static Queue<Integer> process = new LinkedList<Integer>();
     public static volatile HashMap<Integer, Integer> repliesExpectedFromNeighbours = new HashMap<Integer, Integer>();
     //This structure will store all the messages originated at a particular node has been propagated and the replies are
     // expected from its children, till it comes back; <Int = Node ID, LinkedList<Message> = Message storage>
     public static volatile HashMap<Integer, LinkedList<Message>> bufferReplyMessages =
             new HashMap<Integer, LinkedList<Message>>();
 
-    Receiver(HashMap<Integer, ArrayList<String>> neighbours, Integer currPortNum,
-             String currHostName) {
+    Receiver(Integer currPortNum, String currHostName) {
         this.currPortNum = currPortNum;
         this.currHostName = currHostName;
     }
@@ -292,16 +356,21 @@ class Receiver implements Runnable{
             //Initialize the receiver as a continuous listening server
             serverSocket = new ServerSocket(currPortNum);
             System.out.println("Listening on port : " + currPortNum);
-            while (serverOn) {
+            while (!Node.globalTermination) {
                 //If global termination is marked, break the loop and shut down the server
                 if(Node.globalTermination){
-                    serverOn = false;
+                    serverSocket.close();
                     break;
                 }
                 Socket sock = serverSocket.accept();
-                System.out.println("Connected");
-                new Thread(new Processor(sock), "Processor").start();
+                //System.out.println("Connected");
+                new Thread(new ServerHandler(sock), "ServerHandler").start();
+                if(Receiver.messagesToBeProcessed.size() > 0 && !Processor.threadRunning){
+                    System.out.println("There are messages in the process queue, but processor thread is not running, so start it");
+                    new Thread(new ServerHandler(sock), "Processor").start();
+                }
             }
+            //Process and print output as the server is also terminated
         } catch(Exception e){
             System.out.println("Could not create server on port number : " + currPortNum );
             e.printStackTrace();
@@ -309,33 +378,63 @@ class Receiver implements Runnable{
     }
 }
 
+class ServerHandler implements Runnable{
+    public static Socket myClientSocket;
+
+    ServerHandler(Socket socket){
+        this.myClientSocket = socket;
+    }
+
+    @Override
+    public void run(){
+        try {
+            if (Node.globalTermination) {
+                System.out.println("Server has already stopped");
+                return;
+            }
+            //Read the new Message that came on the server and add it to the list of messages to be processed
+            Receiver.messagesToBeProcessed.add((Message)new ObjectInputStream(myClientSocket.getInputStream()).readObject());
+            System.out.println("Accepted Client Address - " + myClientSocket.getInetAddress().getHostName());
+            //If the processor class is not running, then start its thread so it starts processing
+            if(!Processor.threadRunning){
+                Processor.threadRunning = true;
+                new Thread(new Processor(myClientSocket)).start();
+                System.out.println("Started processor thread...");
+            }
+
+        }catch(EOFException eof){
+            //Do nothing
+        } catch (Exception e) {
+            e.printStackTrace();
+        }finally {
+            try {
+                myClientSocket.close();
+            } catch (IOException ioe) {
+                //ioe.printStackTrace();
+            }
+        }
+    }
+}
 class Processor implements Runnable {
+    public static volatile Boolean threadRunning = false;
     Socket myClientSocket;
+    Boolean increasedRound = false;
 
     Processor(Socket s) {
         myClientSocket = s;
     }
 
     public void run() {
-        System.out.println("Accepted Client Address - " + myClientSocket.getInetAddress().getHostName());
-        try {
-            if (!Receiver.serverOn) {
-                System.out.println("Server has already stopped");
-                return;
-            }
-            //Read the new Message that came on the server and add it to the list of messages to be processed
-            Receiver.messagesToBeProcessed.add((Message)new ObjectInputStream(myClientSocket.getInputStream()).readObject());
-            for(Message inMessage : Receiver.messagesToBeProcessed) {
+            //Iterate over all the messages that need to be processed
+            for(Message inMessage : Receiver.messagesToBeProcessed){
+                //Remove the first message and start processing it
+                Receiver.messagesToBeProcessed.remove();
                 System.out.println("InMessage : src node ID : " + inMessage.srcNodeID + " round : " + inMessage.round);
                 //If the current round of node less than the round of message
-                while (inMessage.round > Node.roundOfNode) {
-                    //Add the message to the queue of future messages
-                    if (!Receiver.queueForMessage.contains(inMessage)) {
-                        System.out.println("InMessage round > Node round, adding it to queue");
-                        Receiver.queueForMessage.add(inMessage);
-                    }
-                    //Make the thread sleep for 3 seconds
-                    Thread.sleep(3000);
+                if(inMessage.round > Node.roundOfNode){
+                    //Add the message to the queue which will process it in the future
+                    Receiver.futureRoundMessageQueue.add(inMessage);
+                    continue;
                 }
                 //If the message came with source node ID the same as current node's ID
                 if (inMessage.srcNodeID.equals(Node.nodeID)) {
@@ -350,7 +449,8 @@ class Processor implements Runnable {
                                 // one we got in the message
                                 if (Node.topologyKnowledge.get(key).get(0) > inMessage.nodesDiscovered.get(key).get(0)) {
                                     Node.topologyKnowledge.put(key, inMessage.nodesDiscovered.get(key));
-                                } else {
+                                }
+                                else {
                                     //Do nothing as the values got in the reply is of a higher hop-count than we already have
                                 }
                             }
@@ -381,15 +481,20 @@ class Processor implements Runnable {
                             }
                             //Increase node's round as all neighbours replied back
                             Node.roundOfNode++;
+                            increasedRound = true;
                             System.out.println("Increased node's round to : " + Node.roundOfNode);
-                            if (Receiver.queueForMessage.size() > 0) {
-                                Iterator<Message> processMessageIterator = Receiver.queueForMessage.iterator();
-                                while (processMessageIterator.hasNext()) {
-                                    Message nextMessage = processMessageIterator.next();
-                                    //If the message in a queue has the same round as the node's round, then add it to process list
-                                    if (nextMessage.round == Node.roundOfNode) {
-                                        Receiver.messagesToBeProcessed.add(Receiver.queueForMessage.remove());
-                                        System.out.println("Message added to the process message list");
+                            if(!Node.localTermination && increasedRound) {
+                                increasedRound = false;
+                                new Thread(new Sender(Node.neighbours, Node.topologyKnowledge), "Sender").start();
+                            }
+                            if(!Receiver.futureRoundMessageQueue.isEmpty()){
+                                if(Node.roundOfNode == Receiver.futureRoundMessageQueue.peek().round){
+                                    for(Message message : Receiver.futureRoundMessageQueue){
+                                        if(Node.roundOfNode == Receiver.futureRoundMessageQueue.peek().round) {
+                                            Receiver.messagesToBeProcessed.add(message);
+                                            System.out.println("Message added to the process message list");
+                                            Receiver.futureRoundMessageQueue.remove();
+                                        }
                                     }
                                 }
                             }
@@ -398,6 +503,7 @@ class Processor implements Runnable {
                     //The messages is not a reply, which is not a valid message, discard it
                     else {
                         //Do nothing, go to finally and close the socket and the thread
+                        System.out.println("Not a valid case, reply came for me without reply flag set");
                     }
                 }
                 //If the message came with source node ID other than the current node's ID
@@ -420,10 +526,6 @@ class Processor implements Runnable {
                                 nextNeighbour = iterateNeighbours.next();
                                 //Neighbour found which is not in the discovered nodes list
                                 if (!inMessage.nodesDiscovered.containsKey(nextNeighbour)) {
-                                /*neighbour = new ArrayList<Integer>(2);
-                                neighbour.add(nextNeighbour);
-                                neighbour.add(0);
-                                inMessage.nodesDiscovered.put(myHopCount+1, neighbour);*/
                                     neighboursDiscovered = false;
                                 }
                             }
@@ -433,24 +535,7 @@ class Processor implements Runnable {
                                 neighbour.add(1, 1);//Mark myself done
                                 inMessage.nodesDiscovered.put(Node.nodeID, neighbour);
                             }
-                            if (!inMessage.parentList.isEmpty()) {
-                                Integer dstParent = inMessage.parentList.pop();
-                                ArrayList<String> destination = Node.neighbours.get(dstParent);
-                                try {
-                                    System.out.println("Sending message to : " + destination.get(0));
-                                    System.out.println("OutMessage : src node ID : " + inMessage.srcNodeID + " round : " + inMessage.round);
-                                    Socket clientSocket = new Socket(destination.get(0), Integer.valueOf(destination.get(1)));
-                                    ObjectOutputStream outMessage = new ObjectOutputStream(clientSocket.getOutputStream());
-                                    outMessage.writeObject(inMessage);
-                                    clientSocket.close();
-                                } catch (Exception e) {
-                                    System.out.println(e);
-                                }
-                            } else {
-                                System.out.println("ERROR : Parent list(Stack) is empty...");
-                                System.out.println("Wanted to send below message");
-                                System.out.println("OutMessage : src node ID : " + inMessage.srcNodeID + " round : " + inMessage.round);
-                            }
+                            sendMessageToParent(inMessage);
                         }
                         //The message already has reply->true, so I have to forward it to my parent when I get all
                         // replies from my children for this messages's source node
@@ -485,8 +570,24 @@ class Processor implements Runnable {
                                         }
                                     }
                                 }
+                                //Now mark done flag for myself if all my neighbours are marked done, and send consolidated
+                                // message to parent
+                                Iterator<Integer> it = Node.neighbours.keySet().iterator();
+                                Boolean markMyselfDone = true;
+                                while(it.hasNext()){
+                                    if(inMessage.nodesDiscovered.get(it.next()).get(1) == 0){
+                                        markMyselfDone = false;
+                                    }
+                                }
+                                if(markMyselfDone){
+                                    inMessage.nodesDiscovered.get(Node.nodeID).set(1, 1);
+                                }
+                                else{
+                                    inMessage.nodesDiscovered.get(Node.nodeID).set(1, 0);
+                                }
+                                sendMessageToParent(inMessage);
                             }
-                            //If all the replies are not yet back, till then buffer this reply
+                            //If all the replies are not yet back, then buffer this reply
                             else {
                                 LinkedList<Message> repliesYet = Receiver.bufferReplyMessages.get(inMessage.srcNodeID);
                                 repliesYet.add(inMessage);
@@ -496,24 +597,68 @@ class Processor implements Runnable {
                     }
                     //Hop-count is not zero, so message has to be propagated ahead
                     else {
-                        Integer value = Receiver.repliesExpectedFromNeighbours.get(inMessage.srcNodeID);
-                        Receiver.repliesExpectedFromNeighbours.put(inMessage.srcNodeID, value + 1);
+                        //Propagate the incoming message to your neighbours which are not already in the knowledge
+                        Integer neighbourID;
+                        Iterator<Integer> it = Node.neighbours.keySet().iterator();
+                        while(it.hasNext()) {
+                            neighbourID = it.next();
+                            //The neighbour that we want to send message to is already not available in knowledge
+                            if(!inMessage.nodesDiscovered.containsKey(neighbourID)){
+                                try {
+                                    //Store how many messages are sent for current Node by the current Node
+                                    if(!Receiver.repliesExpectedFromNeighbours.containsKey(inMessage.srcNodeID)){
+                                        Receiver.repliesExpectedFromNeighbours.put(inMessage.srcNodeID, 1);
+                                    }
+                                    else{
+                                        Integer value = Receiver.repliesExpectedFromNeighbours.get(inMessage.srcNodeID);
+                                        Receiver.repliesExpectedFromNeighbours.put(inMessage.srcNodeID, value + 1);
+                                    }
+                                    Integer currHopCount = inMessage.nodesDiscovered.get(Node.nodeID).get(0);
+                                    ArrayList<Integer> nodeInfo = new ArrayList<Integer>(2);
+                                    nodeInfo.add(currHopCount+1);
+                                    nodeInfo.add(0);
+                                    inMessage.nodesDiscovered.put(neighbourID, nodeInfo);
+                                    inMessage.parentList.push(Node.nodeID);
+                                    ArrayList<String> hostPort = Node.neighbours.get(neighbourID);
+                                    System.out.println("Propagating message to :" + hostPort.get(0));
+                                    Socket clientSocket = new Socket(hostPort.get(0), Integer.valueOf(hostPort.get(1)));
+                                    ObjectOutputStream outMessage = new ObjectOutputStream(clientSocket.getOutputStream());
+                                    outMessage.writeObject(inMessage);
+                                    clientSocket.close();
+                                } catch (Exception e) {
+                                    //System.out.println(e);
+                                }
+                            }
+                            else{
+                                System.out.println("Neighbour : " + neighbourID + " is already in the knowledge : ");
+                            }
+                        }
                     }
                 }
-                if(!Node.localTermination) {
-                    new Thread(new Sender(Node.neighbours, Node.topologyKnowledge), "Sender").start();
-                }
             }
-        }catch(EOFException eof){
-          //Do nothing
-        } catch (Exception e) {
-            e.printStackTrace();
-        }finally {
+
+            //Mark my thread as terminated, if any new message comes in, new thread will be started...
+            threadRunning = false;
+    }
+
+    public void sendMessageToParent(Message inMessage){
+        if (!inMessage.parentList.isEmpty()) {
+            Integer dstParent = inMessage.parentList.pop();
+            ArrayList<String> destination = Node.neighbours.get(dstParent);
             try {
-                myClientSocket.close();
-            } catch (IOException ioe) {
-                ioe.printStackTrace();
+                System.out.println("Sending message to : " + destination.get(0));
+                System.out.println("OutMessage : src node ID : " + inMessage.srcNodeID + " round : " + inMessage.round);
+                Socket clientSocket = new Socket(destination.get(0), Integer.valueOf(destination.get(1)));
+                ObjectOutputStream outMessage = new ObjectOutputStream(clientSocket.getOutputStream());
+                outMessage.writeObject(inMessage);
+                clientSocket.close();
+            } catch (Exception e) {
+                //System.out.println(e);
             }
+        } else {
+            System.out.println("ERROR : Parent list(Stack) is empty...");
+            System.out.println("Wanted to send below message");
+            System.out.println("OutMessage : src node ID : " + inMessage.srcNodeID + " round : " + inMessage.round);
         }
     }
 }
